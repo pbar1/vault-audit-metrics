@@ -20,9 +20,8 @@ type AuditEvent struct {
 // PromLabels generates Prometheus metric labels from an audit event.
 func (a *AuditEvent) PromLabels() prometheus.Labels {
 	return prometheus.Labels{
-		"operation":  fmt.Sprint(a.entry.Request.Operation),
-		"path":       a.entry.Request.Path,
-		"mount_type": a.entry.Request.MountType,
-		"error":      a.entry.Error,
+		"operation": fmt.Sprint(a.entry.Request.Operation),
+		"path":      a.entry.Request.Path,
+		"error":     a.entry.Error,
 	}
 }

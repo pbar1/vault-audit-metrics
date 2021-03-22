@@ -15,12 +15,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
+const PromNamespace = "vaultaudit"
+
 // AuditProcessor contains all of the context needed for processing Vault audit logs into Prometheus metrics.
 type AuditProcessor struct {
 	auditNetwork     string
 	auditAddr        string
 	httpAddr         string
 	timestamps       *cache.Cache
+	gagueCacheSize   *prometheus.GaugeVec
 	gagueRequests    *prometheus.GaugeVec
 	gagueResponses   *prometheus.GaugeVec
 	histogramLatency *prometheus.HistogramVec
@@ -40,28 +43,34 @@ func NewAuditProcessor(auditNetwork, auditAddr, httpAddr string, cacheTTL, cache
 
 // addMetrics defines a set of Prometheus metrics and adds them to the AuditProcessor.
 func (p *AuditProcessor) addMetrics() {
+	p.gagueCacheSize = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Namespace: PromNamespace,
+		Subsystem: "cache",
+		Name:      "timestamp_cache_entries_total",
+		Help:      "Number of request timestamp entries in the cache.",
+	}, nil)
 	p.gagueRequests = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "vaultaudit",
+		Namespace: PromNamespace,
 		Subsystem: "events",
 		Name:      "requests_total",
 		Help:      "Number of Vault requests recorded in the audit log. Partitioned by operation, path, and error.",
 	},
 		[]string{"operation", "path", "error"})
 	p.gagueResponses = prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Namespace: "vaultaudit",
+		Namespace: PromNamespace,
 		Subsystem: "events",
 		Name:      "responses_total",
 		Help:      "Number of Vault responses recorded in the audit log. Partitioned by operation, path, and error.",
 	},
 		[]string{"operation", "path", "error"})
 	p.histogramLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Namespace: "vaultaudit",
+		Namespace: PromNamespace,
 		Subsystem: "events",
 		Name:      "response_duration_seconds",
 		Help:      "Latency of a Vault response. Partitioned by operation, path, and error.",
 	},
 		[]string{"operation", "path", "error"})
-	prometheus.MustRegister(p.gagueRequests, p.gagueResponses, p.histogramLatency)
+	prometheus.MustRegister(p.gagueCacheSize, p.gagueRequests, p.gagueResponses, p.histogramLatency)
 }
 
 // handle parses incoming connections into typed AuditEvents and dispatches them for processing.
@@ -147,14 +156,37 @@ func (p *AuditProcessor) observeLatency(auditEvent *AuditEvent) {
 	observer.Observe(responseTime.Sub(requestTime).Seconds())
 }
 
+// monitorTimestampCache continuously updates a metric reflecting the number of items in the request timestamp cache.
+func (p *AuditProcessor) monitorTimestampCache() {
+	for {
+		time.Sleep(10 * time.Second)
+		obs, err := p.gagueCacheSize.GetMetricWith(nil)
+		if err != nil {
+			log.Printf("error getting gagueCacheSize observer: %v\n", err)
+		}
+		obs.Set(float64(p.timestamps.ItemCount()))
+	}
+}
+
+// healthz is a health endpoint.
+func (p *AuditProcessor) healthz(w http.ResponseWriter, _ *http.Request) {
+	if _, err := w.Write([]byte(fmt.Sprintf(`{"timestamp_cache_size":%d}`, p.timestamps.ItemCount()))); err != nil {
+		log.Printf("error writing healthz response: %v", err)
+	}
+}
+
 // Start initiates the AuditProcessor, which includes a server listening for Vault audit log connections, as well as an
 // HTTP server that exposes metrics and status.
 func (p *AuditProcessor) Start() error {
 	// Start the HTTP endpoint
 	http.Handle("/metrics", promhttp.Handler())
+	http.HandleFunc("/healthz", p.healthz)
 	go func() {
 		log.Fatalln(http.ListenAndServe(p.httpAddr, nil))
 	}()
+
+	// keep timestamp cache metrics up to date
+	go p.monitorTimestampCache()
 
 	// Create audit log processing server
 	listener, err := net.Listen(p.auditNetwork, p.auditAddr)
